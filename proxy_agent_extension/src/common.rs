@@ -215,8 +215,8 @@ pub fn report_status_enable_command(
         name: constants::PLUGIN_NAME.to_string(),
         operation: constants::ENABLE_OPERATION.to_string(),
         configurationAppliedTime: misc_helpers::get_date_time_string(),
-        code: constants::STATUS_CODE_OK,
-        status: status.unwrap_or_else(|| constants::TRANSITIONING_STATUS.to_string()),
+        code: constants::STATUS_CODE_NOT_OK,
+        status: constants::ERROR_STATUS.to_string(),
         formattedMessage: FormattedMessage {
             lang: constants::LANG_EN_US.to_string(),
             message: message.to_string(),
