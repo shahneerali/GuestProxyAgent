@@ -207,7 +207,7 @@ pub fn get_proxy_agent_exe_path() -> PathBuf {
 pub fn report_status_enable_command(
     status_folder: PathBuf,
     config_seq_no: &Option<String>,
-    status: Option<String>,
+    _status: Option<String>,
 ) {
     let message: &str = "Enabling the ProxyAgent Extension...";
     //Report Status
