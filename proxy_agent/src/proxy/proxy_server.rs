@@ -23,7 +23,7 @@
 use super::proxy_authorizer::AuthorizeResult;
 use super::proxy_connection::{ConnectionLogger, HttpConnectionContext, TcpConnectionContext};
 use crate::common::{
-    config, constants,
+    constants,
     error::{Error, HyperErrorType},
     helpers, hyper_client, logger,
     result::Result,
@@ -45,7 +45,7 @@ use hyper::service::service_fn;
 use hyper::StatusCode;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use proxy_agent_shared::logger_manager::LoggerLevel;
+use proxy_agent_shared::logger::LoggerLevel;
 use proxy_agent_shared::misc_helpers;
 use proxy_agent_shared::proxy_agent_aggregate_status::ModuleState;
 use proxy_agent_shared::telemetry::event_logger;
@@ -127,8 +127,6 @@ impl ProxyServer {
     }
 
     pub async fn start(&self) {
-        ConnectionLogger::init_logger(config::get_logs_dir()).await;
-
         let addr = format!("{}:{}", std::net::Ipv4Addr::LOCALHOST, self.port);
         logger::write_information(format!("Start proxy listener at '{}'.", &addr));
 
@@ -159,7 +157,7 @@ impl ProxyServer {
 
                 // send this critical error to event logger
                 event_logger::write_event(
-                    event_logger::WARN_LEVEL,
+                    LoggerLevel::Warn,
                     message,
                     "start",
                     "proxy_server",
@@ -251,7 +249,7 @@ impl ProxyServer {
             http_connection_id: 0,
         };
         tcp_connection_logger.write(
-            LoggerLevel::Information,
+            LoggerLevel::Trace,
             format!("Accepted new tcp connection [{}].", tcp_connection_id),
         );
 
@@ -320,7 +318,7 @@ impl ProxyServer {
                     .await
                 {
                     tcp_connection_logger.write(
-                        LoggerLevel::Warning,
+                        LoggerLevel::Warn,
                         format!("ProxyListener serve_connection error: {}", e),
                     );
                 }
@@ -350,7 +348,7 @@ impl ProxyServer {
         // Set the read timeout
         if let Err(e) = std_stream.set_read_timeout(Some(std::time::Duration::from_secs(10))) {
             connection_logger.write(
-                LoggerLevel::Warning,
+                LoggerLevel::Warn,
                 format!("Failed to set read timeout: {}", e),
             );
         }
@@ -403,7 +401,7 @@ impl ProxyServer {
             },
         };
         http_connection_context.log(
-            LoggerLevel::Information,
+            LoggerLevel::Info,
             format!(
                 "Got request from {} for {} {}",
                 tcp_connection_context.client_addr,
@@ -412,7 +410,18 @@ impl ProxyServer {
             ),
         );
 
-        if http_connection_context.url == provision::PROVISION_URL_PATH {
+        if http_connection_context.contains_traversal_characters() {
+            self.log_connection_summary(
+                &http_connection_context,
+                StatusCode::NOT_FOUND,
+                false,
+                "Traversal characters found in the request, return NOT_FOUND!".to_string(),
+            )
+            .await;
+            return Ok(Self::empty_response(StatusCode::NOT_FOUND));
+        }
+
+        if http_connection_context.url == provision::provision_query::PROVISION_URL_PATH {
             return self
                 .handle_provision_state_check_request(http_connection_context.get_logger(), request)
                 .await;
@@ -445,10 +454,7 @@ impl ProxyServer {
                 return Ok(Self::empty_response(StatusCode::MISDIRECTED_REQUEST));
             }
         };
-        http_connection_context.log(
-            LoggerLevel::Information,
-            format!("Use lookup value:{ip}:{port}."),
-        );
+        http_connection_context.log(LoggerLevel::Trace, format!("Use lookup value:{ip}:{port}."));
         let claim_details: String = match serde_json::to_string(&claims) {
             Ok(json) => json,
             Err(e) => {
@@ -462,11 +468,12 @@ impl ProxyServer {
                 return Ok(Self::empty_response(StatusCode::MISDIRECTED_REQUEST));
             }
         };
-        http_connection_context.log(LoggerLevel::Information, claim_details.to_string());
+        http_connection_context.log(LoggerLevel::Trace, claim_details.to_string());
 
         // authenticate the connection
         let access_control_rules = match proxy_authorizer::get_access_control_rules(
             ip.to_string(),
+            port,
             self.key_keeper_shared_state.clone(),
         )
         .await
@@ -553,7 +560,7 @@ impl ProxyServer {
 
         if http_connection_context.should_skip_sig() {
             http_connection_context.log(
-                LoggerLevel::Information,
+                LoggerLevel::Info,
                 format!(
                     "Skip compute signature for the request for {} {}",
                     http_connection_context.method, http_connection_context.url
@@ -603,31 +610,67 @@ impl ProxyServer {
         // check MetaData header exists or not
         if request.headers().get(constants::METADATA_HEADER).is_none() {
             logger.write(
-                LoggerLevel::Warning,
+                LoggerLevel::Warn,
                 "No MetaData header found in the request.".to_string(),
             );
             return Ok(Self::empty_response(StatusCode::BAD_REQUEST));
         }
+        // Get the query time_tick
+        let query_time_tick = match request.headers().get(constants::TIME_TICK_HEADER) {
+            Some(time_tick) => time_tick.to_str().unwrap_or("0"),
+            None => {
+                logger.write(
+                    LoggerLevel::Warn,
+                    "No 'x-ms-azure-time_tick' header found in the request, use '0'.".to_string(),
+                );
+                "0"
+            }
+        };
+        let query_time_tick = match query_time_tick.parse::<i128>() {
+            Ok(time_tick) => time_tick,
+            Err(e) => {
+                logger.write(
+                    LoggerLevel::Warn,
+                    format!("Failed to parse time_tick header: {}", e),
+                );
+                0
+            }
+        };
 
-        // notify key_keeper to poll the status
-        if let Err(e) = self.key_keeper_shared_state.notify().await {
-            logger.write(
-                LoggerLevel::Warning,
-                format!("Failed to notify key_keeper: {}", e),
-            );
-        }
-
-        let provision_state = provision::get_provision_state(
+        let provision_state = provision::get_provision_state_internal(
             self.provision_shared_state.clone(),
             self.agent_status_shared_state.clone(),
+            self.key_keeper_shared_state.clone(),
         )
         .await;
+
+        // report as provision finished state
+        // true only if the finished_time_tick is greater than or equal to the query_time_tick
+        //          or the secure channel is latched already
+        let report_provision_finished = provision_state.finished_time_tick >= query_time_tick
+            || provision_state.is_secure_channel_latched();
+
+        let find_notify_header = request.headers().get(constants::NOTIFY_HEADER).is_some();
+        if find_notify_header && !report_provision_finished {
+            logger.write(
+                LoggerLevel::Warn,
+                "Provision is not finished yet, notify key_keeper to pull the status.".to_string(),
+            );
+            if let Err(e) = self.key_keeper_shared_state.notify().await {
+                logger.write(
+                    LoggerLevel::Warn,
+                    format!("Failed to notify key_keeper: {}", e),
+                );
+            }
+        }
+
+        let provision_state = provision::provision_query::ProvisionState::new(
+            report_provision_finished,
+            provision_state.error_message,
+        );
         match serde_json::to_string(&provision_state) {
             Ok(json) => {
-                logger.write(
-                    LoggerLevel::Information,
-                    format!("Provision state: {}", json),
-                );
+                logger.write(LoggerLevel::Info, format!("Provision state: {}", json));
                 let mut response = Response::new(hyper_client::full_body(json.as_bytes().to_vec()));
                 response.headers_mut().insert(
                     hyper::header::CONTENT_TYPE,
@@ -637,7 +680,7 @@ impl ProxyServer {
             }
             Err(e) => {
                 let error = format!("Failed to get provision state: {}", e);
-                logger.write(LoggerLevel::Warning, error.to_string());
+                logger.write(LoggerLevel::Warn, error.to_string());
                 let mut response =
                     Response::new(hyper_client::full_body(error.as_bytes().to_vec()));
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -742,7 +785,7 @@ impl ProxyServer {
             userGroups: claims.userGroups.clone(),
             clientIp: claims.clientIp.to_string(),
             clientPort: claims.clientPort,
-            processFullPath: claims.processFullPath.to_string(),
+            processFullPath: claims.processFullPath,
             processCmdLine: claims.processCmdLine.to_string(),
             runAsElevated: claims.runAsElevated,
             method: http_connection_context.method.to_string(),
@@ -760,7 +803,7 @@ impl ProxyServer {
         if let Ok(json) = serde_json::to_string(&summary) {
             logger::write_console_log(json.to_string());
             event_logger::write_event(
-                event_logger::INFO_LEVEL,
+                LoggerLevel::Info,
                 json,
                 "log_connection_summary",
                 "proxy_server",
@@ -774,7 +817,7 @@ impl ProxyServer {
                 .await
             {
                 http_connection_context.log(
-                    LoggerLevel::Warning,
+                    LoggerLevel::Warn,
                     format!("Failed to add failed connection summary: {}", e),
                 );
             }
@@ -784,7 +827,7 @@ impl ProxyServer {
             .await
         {
             http_connection_context.log(
-                LoggerLevel::Warning,
+                LoggerLevel::Warn,
                 format!("Failed to add connection summary: {}", e),
             );
         }
@@ -817,7 +860,7 @@ impl ProxyServer {
         };
 
         http_connection_context.log(
-            LoggerLevel::Information,
+            LoggerLevel::Trace,
             format!(
                 "Received the client request body (len={}) for {} {}",
                 whole_body.len(),
@@ -865,7 +908,7 @@ impl ProxyServer {
                     );
 
                     http_connection_context.log(
-                        LoggerLevel::Information,
+                        LoggerLevel::Trace,
                         format!("Added authorization header {}", authorization_value),
                     )
                 }
@@ -878,7 +921,7 @@ impl ProxyServer {
             }
         } else {
             http_connection_context.log(
-                LoggerLevel::Information,
+                LoggerLevel::Trace,
                 "current key is empty, skip computing the signature.".to_string(),
             );
         }
@@ -894,31 +937,14 @@ impl ProxyServer {
 mod tests {
     use crate::common::hyper_client;
     use crate::common::logger;
-    use crate::proxy::proxy_connection::ConnectionLogger;
     use crate::proxy::proxy_server;
     use crate::shared_state;
     use http::Method;
-    use proxy_agent_shared::logger_manager;
     use std::collections::HashMap;
-    use std::env;
-    use std::fs;
     use std::time::Duration;
 
     #[tokio::test]
     async fn direct_request_test() {
-        let logger_key = "direct_request_test";
-        let mut temp_test_path = env::temp_dir();
-        temp_test_path.push(logger_key);
-        logger_manager::init_logger(
-            logger::AGENT_LOGGER_KEY.to_string(), // production code uses 'Agent_Log' to write.
-            temp_test_path.clone(),
-            logger_key.to_string(),
-            10 * 1024 * 1024,
-            20,
-        )
-        .await;
-        ConnectionLogger::init_logger(temp_test_path.to_path_buf()).await;
-
         // start listener, the port must different from the one used in production code
         let host = "127.0.0.1";
         let port: u16 = 8091;
@@ -963,6 +989,34 @@ mod tests {
             "response.status must be MISDIRECTED_REQUEST."
         );
 
+        // test with traversal characters
+        let url: hyper::Uri = format!("http://{}:{}/test/../", host, port)
+            .parse()
+            .unwrap();
+        let request = hyper_client::build_request(
+            Method::GET,
+            &url,
+            &HashMap::new(),
+            None,
+            key_keeper_shared_state
+                .get_current_key_guid()
+                .await
+                .unwrap_or(None),
+            key_keeper_shared_state
+                .get_current_key_value()
+                .await
+                .unwrap_or(None),
+        )
+        .unwrap();
+        let response = hyper_client::send_request(host, port, request, logger::write_warning)
+            .await
+            .unwrap();
+        assert_eq!(
+            http::StatusCode::NOT_FOUND,
+            response.status(),
+            "response.status must be NOT_FOUND."
+        );
+
         // test large request body
         let body = vec![88u8; super::REQUEST_BODY_LOW_LIMIT_SIZE + 1];
         let request = hyper_client::build_request(
@@ -991,8 +1045,5 @@ mod tests {
 
         // stop the listener
         cancellation_token.cancel();
-
-        // clean up and ignore the clean up errors
-        _ = fs::remove_dir_all(temp_test_path);
     }
 }

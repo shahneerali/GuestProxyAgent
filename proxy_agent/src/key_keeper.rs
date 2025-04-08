@@ -26,12 +26,11 @@
 pub mod key;
 
 use self::key::Key;
-use crate::common::error::Error;
+use crate::common::error::{Error, KeyErrorType};
 use crate::common::result::Result;
 use crate::common::{constants, helpers, logger};
 use crate::provision;
 use crate::proxy::authorization_rules::{AuthorizationRulesForLogging, ComputedAuthorizationRules};
-use crate::redirector::Redirector;
 use crate::shared_state::agent_status_wrapper::{AgentStatusModule, AgentStatusSharedState};
 use crate::shared_state::key_keeper_wrapper::KeyKeeperSharedState;
 use crate::shared_state::provision_wrapper::ProvisionSharedState;
@@ -40,9 +39,11 @@ use crate::shared_state::telemetry_wrapper::TelemetrySharedState;
 use crate::shared_state::SharedState;
 use crate::{acl, redirector};
 use hyper::Uri;
+use proxy_agent_shared::logger::LoggerLevel;
 use proxy_agent_shared::misc_helpers;
 use proxy_agent_shared::proxy_agent_aggregate_status::ModuleState;
 use proxy_agent_shared::telemetry::event_logger;
+use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use std::{path::PathBuf, time::Duration};
@@ -105,38 +106,9 @@ impl KeyKeeper {
     }
 
     /// poll secure channel status at interval from the WireServer endpoint
-    pub async fn poll_secure_channel_status<'a>(&self) {
+    pub async fn poll_secure_channel_status(&self) {
         self.update_status_message("poll secure channel status task started.".to_string(), true)
             .await;
-
-        // launch redirector initialization when the key keeper task is running
-        tokio::spawn({
-            let cancellation_token = self.cancellation_token.clone();
-            let key_keeper_shared_state = self.key_keeper_shared_state.clone();
-            let telemetry_shared_state = self.telemetry_shared_state.clone();
-            let provision_shared_state = self.provision_shared_state.clone();
-            let agent_status_shared_state = self.agent_status_shared_state.clone();
-
-            let redirector = Redirector::new(
-                constants::PROXY_AGENT_PORT,
-                self.redirector_shared_state.clone(),
-                self.key_keeper_shared_state.clone(),
-                agent_status_shared_state.clone(),
-            );
-            async move {
-                redirector.start().await;
-                if redirector.is_started().await {
-                    provision::redirector_ready(
-                        cancellation_token.clone(),
-                        key_keeper_shared_state.clone(),
-                        telemetry_shared_state.clone(),
-                        provision_shared_state.clone(),
-                        agent_status_shared_state.clone(),
-                    )
-                    .await;
-                }
-            }
-        });
 
         if let Err(e) = misc_helpers::try_create_folder(&self.key_dir) {
             logger::write_warning(format!(
@@ -151,19 +123,35 @@ impl KeyKeeper {
             ));
         }
 
-        match acl::acl_directory(self.key_dir.to_path_buf()) {
+        match acl::acl_directory(self.key_dir.clone()) {
             Ok(()) => {
                 logger::write(format!(
-                    "key folder {} ACLed if has not before.",
+                    "Folder {} ACLed if has not before.",
                     misc_helpers::path_to_string(&self.key_dir)
                 ));
             }
             Err(e) => {
                 logger::write_warning(format!(
-                    "key folder {} ACLed failed with error {}.",
+                    "Folder {} ACLed failed with error {}.",
                     misc_helpers::path_to_string(&self.key_dir),
                     e
                 ));
+            }
+        }
+
+        // acl current executable dir
+        #[cfg(windows)]
+        {
+            if let Ok(current_exe) = std::env::current_exe() {
+                if let Some(current_dir) = current_exe.parent() {
+                    if let Err(e) = acl::acl_directory(current_dir.to_path_buf()) {
+                        logger::write_warning(format!(
+                            "Current executable directory {} ACLed failed with error {}.",
+                            misc_helpers::path_to_string(current_dir),
+                            e
+                        ));
+                    }
+                }
             }
         }
 
@@ -241,14 +229,26 @@ impl KeyKeeper {
                     // this is to handle quicker response to the secure channel state change during VM provisioning.
                     _ = notify.notified() => {
                         if  current_state == DISABLE_STATE || current_state == UNKNOWN_STATE {
-                            logger::write_warning(format!("poll_secure_channel_status task notified and secure channel state is '{}', start poll status now.", current_state));
+                            logger::write_warning(format!("poll_secure_channel_status task notified and secure channel state is '{}', reset states and start poll status now.", current_state));
                             provision::key_latch_ready_state_reset(self.provision_shared_state.clone()).await;
+                            if let Err(e) =  self.key_keeper_shared_state.update_current_secure_channel_state(UNKNOWN_STATE.to_string()).await{
+                                logger::write_warning(format!("Failed to update secure channel state to 'Unknown': {}", e));
+                            }
 
                             if start.elapsed().as_millis() > PROVISION_TIMEUP_IN_MILLISECONDS {
                                 // already timeup, reset the start timer
                                 start = Instant::now();
+                                provision_timeup = false;
                             }
                         } else {
+                            // report key latched ready to try update the provision finished time_tick
+                            provision::key_latched(
+                                self.cancellation_token.clone(),
+                                self.key_keeper_shared_state.clone(),
+                                self.telemetry_shared_state.clone(),
+                                self.provision_shared_state.clone(),
+                                self.agent_status_shared_state.clone(),
+                            ).await;
                             let slept_time_in_millisec = time.elapsed().as_millis();
                             let continue_sleep = sleep.as_millis() - slept_time_in_millisec;
                             if continue_sleep > 0 {
@@ -303,6 +303,8 @@ impl KeyKeeper {
             let mut access_control_rules_changed = false;
             let wireserver_rule_id = status.get_wireserver_rule_id();
             let imds_rule_id: String = status.get_imds_rule_id();
+            let hostga_rule_id: String = status.get_hostga_rule_id();
+
             match self
                 .key_keeper_shared_state
                 .update_wireserver_rule_id(wireserver_rule_id.to_string())
@@ -355,16 +357,44 @@ impl KeyKeeper {
                 }
             }
 
+            match self
+                .key_keeper_shared_state
+                .update_hostga_rule_id(hostga_rule_id.to_string())
+                .await
+            {
+                Ok((updated, old_hostga_rule_id)) => {
+                    if updated {
+                        logger::write_warning(format!(
+                            "HostGA rule id changed from '{}' to '{}'.",
+                            old_hostga_rule_id, hostga_rule_id
+                        ));
+                        if let Err(e) = self
+                            .key_keeper_shared_state
+                            .set_hostga_rules(status.get_hostga_rules())
+                            .await
+                        {
+                            logger::write_error(format!("Failed to set HostGA rules: {}", e));
+                        }
+                        access_control_rules_changed = true;
+                    }
+                }
+                Err(e) => {
+                    logger::write_warning(format!("Failed to update HostGA rule id: {}", e));
+                }
+            }
+
             if access_control_rules_changed {
-                if let (Ok(wireserver_rules), Ok(imds_rules)) = (
+                if let (Ok(wireserver_rules), Ok(imds_rules), Ok(hostga_rules)) = (
                     self.key_keeper_shared_state.get_wireserver_rules().await,
                     self.key_keeper_shared_state.get_imds_rules().await,
+                    self.key_keeper_shared_state.get_hostga_rules().await,
                 ) {
                     let rules = AuthorizationRulesForLogging::new(
                         status.authorizationRules.clone(),
                         ComputedAuthorizationRules {
                             wireserver: wireserver_rules,
                             imds: imds_rules,
+                            hostga: hostga_rules,
                         },
                     );
                     rules.write_all(&self.log_dir, constants::MAX_LOG_FILE_COUNT);
@@ -381,59 +411,42 @@ impl KeyKeeper {
                 let mut key_found = false;
                 if let Some(guid) = &status.keyGuid {
                     // key latched before and search the key locally first
-                    let mut key_file = self.key_dir.to_path_buf().join(guid);
-                    key_file.set_extension("key");
-                    // the key already latched before
-                    if key_file.exists() {
-                        // read the key details locally and update
-                        match misc_helpers::json_read_from_file::<Key>(&key_file) {
-                            Ok(key) => {
-                                if let Err(e) =
-                                    self.key_keeper_shared_state.update_key(key.clone()).await
-                                {
-                                    logger::write_warning(format!("Failed to update key: {}", e));
-                                }
-
-                                let message = helpers::write_startup_event(
-                                    "Found key details from local and ready to use.",
-                                    "poll_secure_channel_status",
-                                    "key_keeper",
-                                    logger::AGENT_LOGGER_KEY,
-                                );
-                                self.update_status_message(message, false).await;
-                                key_found = true;
-
-                                provision::key_latched(
-                                    self.cancellation_token.clone(),
-                                    self.key_keeper_shared_state.clone(),
-                                    self.telemetry_shared_state.clone(),
-                                    self.provision_shared_state.clone(),
-                                    self.agent_status_shared_state.clone(),
-                                )
-                                .await;
+                    match Self::fetch_key(&self.key_dir, guid) {
+                        Ok(key) => {
+                            if let Err(e) =
+                                self.key_keeper_shared_state.update_key(key.clone()).await
+                            {
+                                logger::write_warning(format!("Failed to update key: {}", e));
                             }
-                            Err(e) => {
-                                let message = format!("Failed to read latched key details from file: {:?}. Will try acquire the key details from Server.",
-                                e);
-                                event_logger::write_event(
-                                    event_logger::WARN_LEVEL,
-                                    message.to_string(),
-                                    "poll_secure_channel_status",
-                                    "key_keeper",
-                                    logger::AGENT_LOGGER_KEY,
-                                );
-                            }
-                        };
-                    } else {
-                        let message = "The latched key file does not exist locally. Will try acquire the key details from Server.".to_string();
-                        event_logger::write_event(
-                            event_logger::WARN_LEVEL,
-                            message.to_string(),
-                            "poll_secure_channel_status",
-                            "key_keeper",
-                            logger::AGENT_LOGGER_KEY,
-                        );
-                    }
+
+                            let message = helpers::write_startup_event(
+                                "Found key details from local and ready to use.",
+                                "poll_secure_channel_status",
+                                "key_keeper",
+                                logger::AGENT_LOGGER_KEY,
+                            );
+                            self.update_status_message(message, false).await;
+                            key_found = true;
+
+                            provision::key_latched(
+                                self.cancellation_token.clone(),
+                                self.key_keeper_shared_state.clone(),
+                                self.telemetry_shared_state.clone(),
+                                self.provision_shared_state.clone(),
+                                self.agent_status_shared_state.clone(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            event_logger::write_event(
+                                LoggerLevel::Info,
+                                format!("Failed to fetch local key details with error: {:?}. Will try acquire the key details from Server.", e),
+                                "poll_secure_channel_status",
+                                "key_keeper",
+                                logger::AGENT_LOGGER_KEY,
+                            );
+                        }
+                    };
                 }
 
                 // if key has not latched before,
@@ -453,12 +466,9 @@ impl KeyKeeper {
                         }
                     };
 
-                    // key has not latched before,
-                    // set the key_file full path from key details
+                    // persist the new key to local disk
                     let guid = key.guid.to_string();
-                    let mut key_file = self.key_dir.to_path_buf().join(&guid);
-                    key_file.set_extension("key");
-                    match misc_helpers::json_write_to_file(&key, &key_file) {
+                    match Self::store_key(&self.key_dir, &key) {
                         Ok(()) => {
                             logger::write_information(format!(
                         "Successfully acquired the key '{}' details from server and saved locally.", guid));
@@ -474,7 +484,7 @@ impl KeyKeeper {
                     }
 
                     // double check the key details saved correctly to local disk
-                    if let Err(e) = Self::check_local_key(&self.key_dir, &key) {
+                    if let Err(e) = Self::check_key(&self.key_dir, &key) {
                         self.update_status_message(
                             format!(
                                 "Failed to check the key '{}' details saved locally: {:?}.",
@@ -538,6 +548,11 @@ impl KeyKeeper {
                             self.redirector_shared_state.clone(),
                         )
                         .await;
+                        redirector::update_hostga_redirect_policy(
+                            status.get_hostga_mode() != DISABLE_STATE,
+                            self.redirector_shared_state.clone(),
+                        )
+                        .await;
 
                         // customer has not enforce the secure channel state
                         if state == DISABLE_STATE {
@@ -579,13 +594,9 @@ impl KeyKeeper {
             .await
         {
             Ok(updated) => {
-                if log_to_file {
-                    if updated {
-                        logger::write_information(message);
-                    } else {
-                        // not updated, log at verbose level
-                        logger::write(message);
-                    }
+                if log_to_file && !updated {
+                    // not updated, log at verbose level
+                    logger::write(message);
                 }
             }
             Err(e) => {
@@ -594,46 +605,150 @@ impl KeyKeeper {
         }
     }
 
-    // key was saved locally correctly before
-    // check the key file found and its guid and key value are corrected
-    fn check_local_key(key_dir: &Path, key: &Key) -> Result<()> {
+    fn store_local_key(key_dir: &Path, key: &Key, encrypted: bool) -> Result<()> {
         let guid = key.guid.to_string();
-        let mut key_file = key_dir.join(guid);
-        key_file.set_extension("key");
+        let mut key_file = key_dir.to_path_buf().join(guid);
+        if encrypted {
+            key_file.set_extension("encrypted");
+            #[cfg(windows)]
+            {
+                crate::common::store_key_data(
+                    &key_file,
+                    serde_json::to_string(&key).map_err(|e| {
+                        Error::Key(KeyErrorType::StoreLocalKey(format!(
+                            "serialize key error: {:?} ",
+                            e
+                        )))
+                    })?,
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                // return NotSupported error for non-windows platform
+                Err(Error::Key(KeyErrorType::StoreLocalKey(
+                    "Not supported to store encrypted key on non-windows platform.".to_string(),
+                )))
+            }
+        } else {
+            key_file.set_extension("key");
+            misc_helpers::json_write_to_file(&key, &key_file).map_err(|e| {
+                Error::Key(KeyErrorType::StoreLocalKey(format!(
+                    "json_write_to_file '{}' failed {}",
+                    key_file.display(),
+                    e
+                )))
+            })
+        }
+    }
+
+    fn store_key(key_dir: &Path, key: &Key) -> Result<()> {
+        #[cfg(windows)]
+        {
+            // save the key to encrypted file
+            Self::store_local_key(key_dir, key, true)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::store_local_key(key_dir, key, false)
+        }
+    }
+
+    fn fetch_local_key(key_dir: &Path, key_guid: &str, encrypted: bool) -> Result<Key> {
+        let mut key_file = key_dir.join(key_guid);
+        if encrypted {
+            key_file.set_extension("encrypted");
+        } else {
+            key_file.set_extension("key");
+        }
         if !key_file.exists() {
             // guid.key file does not exist locally
             return Err(Error::Key(
-                crate::common::error::KeyErrorType::CheckLocalKey(format!(
+                crate::common::error::KeyErrorType::FetchLocalKey(format!(
                     "Key file '{}' does not exist locally.",
                     key_file.display()
                 )),
             ));
         }
 
-        match misc_helpers::json_read_from_file::<Key>(&key_file) {
-            Ok(local_key) => {
-                if local_key.guid == key.guid && local_key.key == key.key {
-                    Ok(())
-                } else {
-                    // guid.key file found but guid or key value is not matched
-                    Err(Error::Key(
-                        crate::common::error::KeyErrorType::CheckLocalKey(format!(
-                            "Key file '{}' found but guid or key value is not matched.",
-                            key_file.display()
-                        )),
-                    ))
+        let key_data = if encrypted {
+            #[cfg(not(windows))]
+            {
+                // return NotSupported error for non-windows platform
+                return Err(Error::Key(KeyErrorType::FetchLocalKey(
+                    "Not supported to fetch encrypted key on non-windows platform.".to_string(),
+                )));
+            }
+            #[cfg(windows)]
+            {
+                crate::common::fetch_key_data(&key_file)?
+            }
+        } else {
+            fs::read_to_string(&key_file).map_err(|e| {
+                Error::Io(format!("read key file '{}' failed", key_file.display()), e)
+            })?
+        };
+
+        serde_json::from_str::<Key>(&key_data).map_err(|e| {
+            Error::Key(crate::common::error::KeyErrorType::FetchLocalKey(format!(
+                "Parse key data with error: {}",
+                e
+            )))
+        })
+    }
+
+    fn fetch_key(key_dir: &Path, key_guid: &str) -> Result<Key> {
+        // fetch encrypted key file first
+        match Self::fetch_local_key(key_dir, key_guid, true) {
+            Ok(key) => Ok(key),
+            Err(_e) => {
+                #[cfg(windows)]
+                {
+                    logger::write_information(format!(
+                        "Failed to fetch .encrypted file with error: {}. Fallback to fetch .key file for windows platform.",
+                        _e
+                    ));
                 }
+
+                // fallback to fetch key file
+                let local_key = Self::fetch_local_key(key_dir, key_guid, false)?;
+
+                #[cfg(windows)]
+                {
+                    // re-save the key to encrypted file for windows platform
+                    Self::store_local_key(key_dir, &local_key, true)?;
+                }
+
+                Ok(local_key)
             }
-            Err(e) => {
-                // failed to parse guid.key file
-                Err(Error::Key(
-                    crate::common::error::KeyErrorType::CheckLocalKey(format!(
-                        "Parse key file '{}' with error: {}",
-                        key_file.display(),
-                        e
-                    )),
-                ))
-            }
+        }
+    }
+
+    // key was saved locally correctly before
+    // check the key file found and its guid and key value are corrected
+    fn check_local_key(key_dir: &Path, key: &Key, encrypted: bool) -> Result<()> {
+        let guid = key.guid.to_string();
+        let local_key = Self::fetch_local_key(key_dir, &guid, encrypted)?;
+
+        if local_key.guid == key.guid && local_key.key == key.key {
+            Ok(())
+        } else {
+            // guid.key file found but guid or key value is not matched
+            Err(Error::Key(
+                crate::common::error::KeyErrorType::CheckLocalKey(
+                    "Local key guid or key value is not matched.".to_string(),
+                ),
+            ))
+        }
+    }
+
+    fn check_key(key_dir: &Path, key: &Key) -> Result<()> {
+        #[cfg(windows)]
+        {
+            Self::check_local_key(key_dir, key, true)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::check_local_key(key_dir, key, false)
         }
     }
 
@@ -655,11 +770,10 @@ impl KeyKeeper {
 #[cfg(test)]
 mod tests {
     use super::key::Key;
-    use crate::common::logger;
     use crate::key_keeper;
     use crate::key_keeper::KeyKeeper;
     use crate::test_mock::server_mock;
-    use proxy_agent_shared::{logger_manager, misc_helpers};
+    use proxy_agent_shared::misc_helpers;
     use std::env;
     use std::fs;
     use std::time::Duration;
@@ -672,14 +786,6 @@ mod tests {
         temp_test_path.push(logger_key);
         // clean up and ignore the clean up errors
         _ = fs::remove_dir_all(&temp_test_path);
-        logger_manager::init_logger(
-            logger_key.to_string(),
-            temp_test_path.clone(),
-            logger_key.to_string(),
-            200,
-            6,
-        )
-        .await;
         _ = misc_helpers::try_create_folder(&temp_test_path);
 
         let key_str = r#"{
@@ -689,11 +795,25 @@ mod tests {
             "key": "4A404E635266556A586E3272357538782F413F4428472B4B6250645367566B59"        
         }"#;
         let key: Key = serde_json::from_str(key_str).unwrap();
-        let mut key_file = temp_test_path.to_path_buf().join(key.guid.clone());
-        key_file.set_extension("key");
-        _ = misc_helpers::json_write_to_file(&key, &key_file);
 
-        assert!(KeyKeeper::check_local_key(&temp_test_path, &key).is_ok());
+        KeyKeeper::store_local_key(&temp_test_path, &key, false).unwrap();
+        assert!(KeyKeeper::check_local_key(&temp_test_path, &key, false).is_ok());
+        let local_key = KeyKeeper::fetch_key(&temp_test_path, &key.guid).unwrap();
+        assert_eq!(
+            key.key, local_key.key,
+            "Key value should be matched without encrypted."
+        );
+
+        #[cfg(windows)]
+        {
+            // test encrypted key for windows platform
+            assert!(KeyKeeper::check_local_key(&temp_test_path, &key, true).is_ok());
+            let local_key = KeyKeeper::fetch_key(&temp_test_path, &key.guid).unwrap();
+            assert_eq!(
+                key.key, local_key.key,
+                "Key value should be matched with encrypted."
+            );
+        }
 
         _ = fs::remove_dir_all(&temp_test_path);
     }
@@ -714,16 +834,6 @@ mod tests {
                 print!("Failed to remove_dir_all with error {}.", e);
             }
         }
-
-        // init main logger
-        logger_manager::init_logger(
-            logger::AGENT_LOGGER_KEY.to_string(), // production code uses 'Agent_Log' to write.
-            log_dir.clone(),
-            "logger_key".to_string(),
-            10 * 1024 * 1024,
-            20,
-        )
-        .await;
 
         let cancellation_token = CancellationToken::new();
         // start wire_server listener

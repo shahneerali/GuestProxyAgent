@@ -13,9 +13,10 @@ proxy_agent_shared = { path ="../proxy_agent_shared"}
 clap = { version = "4.5.17", features =["derive"] } # Command Line Argument Parser
 thiserror = "1.0.64"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync"] }
+ctor = "0.3.6"                # used for test setup and clean up
 
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.5.0"     # windows NT 
+windows-service = "0.7.0"     # windows NT 
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1.12"             # Rust Windows resource helper to add file version
@@ -35,4 +36,4 @@ features = [
 ]
 
 [target.'cfg(not(windows))'.dependencies]
-sysinfo = "0.29.10"            # read process information for Linux
+sysinfo = "0.30.13"            # read process information for Linux

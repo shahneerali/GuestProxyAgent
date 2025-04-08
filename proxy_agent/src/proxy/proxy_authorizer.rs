@@ -13,79 +13,17 @@
 //! use std::str::FromStr;
 //!
 //! let key_keeper_shared_state = KeyKeeperSharedState::start_new();
-//! let vm_metadata = proxy_authorizer::get_access_control_rules(constants::WIRE_SERVER_IP.to_string(), key_keeper_shared_state.clone()).await.unwrap();
+//! let vm_metadata = proxy_authorizer::get_access_control_rules(constants::WIRE_SERVER_IP.to_string(), constants::WIRE_SERVER_PORT, key_keeper_shared_state.clone()).await.unwrap();
 //! let authorizer = proxy_authorizer::get_authorizer(constants::WIRE_SERVER_IP, constants::WIRE_SERVER_PORT, claims);
 //! let url = hyper::Uri::from_str("http://localhost/test?").unwrap();
 //! authorizer.authorize(logger, url, vm_metadata);
 //!  
 
-use proxy_agent_shared::logger_manager::LoggerLevel;
-
 use super::authorization_rules::{AuthorizationMode, ComputedAuthorizationItem};
 use super::proxy_connection::ConnectionLogger;
 use crate::shared_state::key_keeper_wrapper::KeyKeeperSharedState;
-use crate::{common::config, common::constants, common::result::Result, proxy::Claims};
-
-#[cfg(windows)]
-mod default {
-    use crate::proxy::Claims;
-    use proxy_agent_shared::misc_helpers;
-    use std::path::PathBuf;
-
-    const VM_APPLICATION_MANAGER_FILE_NAME: &str = "vm-application-manager";
-    const WINDOWS_AZURE_GUEST_AGENT_FILE_NAME: &str = "windowsazureguestagent.exe";
-    const WAAPPAGENT_FILE_NAME: &str = "waappagent.exe";
-    const COLLECT_GUEST_LOG_FILE_NAME: &str = "collectguestlogs.exe";
-    const SEC_AGENT_FILE_NAME: &str = "wasecagentprov.exe";
-    const IMMEDIATE_RUNCOMMAND_SERVICE_FILE_NAME: &str = "immediateruncommandservice.exe";
-
-    pub fn is_platform_process(claims: &Claims) -> bool {
-        let process_name =
-            misc_helpers::get_file_name(&PathBuf::from(&claims.processName)).to_lowercase();
-        if process_name == VM_APPLICATION_MANAGER_FILE_NAME
-            || process_name == WINDOWS_AZURE_GUEST_AGENT_FILE_NAME
-            || process_name == WAAPPAGENT_FILE_NAME
-            || process_name == COLLECT_GUEST_LOG_FILE_NAME
-            || process_name == SEC_AGENT_FILE_NAME
-            || process_name == IMMEDIATE_RUNCOMMAND_SERVICE_FILE_NAME
-        {
-            return true;
-        }
-
-        false
-    }
-}
-
-#[cfg(not(windows))]
-mod default {
-    use crate::proxy::Claims;
-    use once_cell::sync::Lazy;
-    use proxy_agent_shared::misc_helpers;
-    use regex::Regex;
-    use std::path::PathBuf;
-
-    const VM_APPLICATION_MANAGER_FILE_NAME: &str = "vm-application-manager";
-    const IMMEDIATE_RUNCOMMAND_SERVICE_FILE_NAME: &str = "immediate-run-command-handler";
-    static LINUX_VM_AGENT_REGEX: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r".*python.*walinuxagent").unwrap());
-
-    pub fn is_platform_process(claims: &Claims) -> bool {
-        let process_name =
-            misc_helpers::get_file_name(&PathBuf::from(&claims.processName)).to_lowercase();
-        if process_name == VM_APPLICATION_MANAGER_FILE_NAME
-            || process_name == IMMEDIATE_RUNCOMMAND_SERVICE_FILE_NAME
-        {
-            return true;
-        }
-
-        let process_cmd_line = claims.processCmdLine.to_string().to_lowercase();
-        if LINUX_VM_AGENT_REGEX.is_match(&process_cmd_line) {
-            return true;
-        }
-
-        false
-    }
-}
+use crate::{common::constants, common::result::Result, proxy::Claims};
+use proxy_agent_shared::logger::LoggerLevel;
 
 #[derive(PartialEq)]
 pub enum AuthorizeResult {
@@ -128,7 +66,7 @@ impl Authorizer for WireServer {
             } else {
                 if rules.mode == AuthorizationMode::Audit {
                     logger.write(
-                            LoggerLevel::Information, format!("WireServer request {} denied in audit mode, continue forward the request", request_url));
+                            LoggerLevel::Info, format!("WireServer request {} denied in audit mode, continue forward the request", request_url));
                     return AuthorizeResult::OkWithAudit;
                 }
                 return AuthorizeResult::Forbidden;
@@ -141,7 +79,8 @@ impl Authorizer for WireServer {
     fn to_string(&self) -> String {
         format!(
             "WireServer {{ runAsElevated: {}, processName: {} }}",
-            self.claims.runAsElevated, self.claims.processName
+            self.claims.runAsElevated,
+            self.claims.processName.to_string_lossy()
         )
     }
 }
@@ -163,7 +102,7 @@ impl Authorizer for Imds {
             } else {
                 if rules.mode == AuthorizationMode::Audit {
                     logger.write(
-                        LoggerLevel::Information,
+                        LoggerLevel::Info,
                         format!(
                             "IMDS request {} denied in audit mode, continue forward the request",
                             request_url
@@ -190,28 +129,35 @@ struct GAPlugin {
 impl Authorizer for GAPlugin {
     fn authorize(
         &self,
-        _logger: ConnectionLogger,
-        _request_url: hyper::Uri,
-        _access_control_rules: Option<ComputedAuthorizationItem>,
+        logger: ConnectionLogger,
+        request_url: hyper::Uri,
+        access_control_rules: Option<ComputedAuthorizationItem>,
     ) -> AuthorizeResult {
         if !self.claims.runAsElevated {
             return AuthorizeResult::Forbidden;
         }
-        if config::get_host_gaplugin_support() == 2 {
-            // only allow VMAgent and platform vm extensions talk to GAPlugin
-            if default::is_platform_process(&self.claims) {
+
+        if let Some(rules) = access_control_rules {
+            if rules.is_allowed(logger.clone(), request_url.clone(), self.claims.clone()) {
                 return AuthorizeResult::Ok;
             } else {
+                if rules.mode == AuthorizationMode::Audit {
+                    logger.write(
+                            LoggerLevel::Info, format!("HostGAPlugin request {} denied in audit mode, continue forward the request", request_url));
+                    return AuthorizeResult::OkWithAudit;
+                }
                 return AuthorizeResult::Forbidden;
             }
         }
+
         AuthorizeResult::Ok
     }
 
     fn to_string(&self) -> String {
         format!(
             "GAPlugin {{ runAsElevated: {}, processName: {} }}",
-            self.claims.runAsElevated, self.claims.processName
+            self.claims.runAsElevated,
+            self.claims.processName.to_string_lossy()
         )
     }
 }
@@ -265,11 +211,19 @@ pub fn get_authorizer(ip: String, port: u16, claims: Claims) -> Box<dyn Authoriz
 
 pub async fn get_access_control_rules(
     ip: String,
+    port: u16,
     key_keeper_shared_state: KeyKeeperSharedState,
 ) -> Result<Option<ComputedAuthorizationItem>> {
-    match ip.as_str() {
-        constants::WIRE_SERVER_IP => key_keeper_shared_state.get_wireserver_rules().await,
-        constants::IMDS_IP => key_keeper_shared_state.get_imds_rules().await,
+    match (ip.as_str(), port) {
+        (constants::WIRE_SERVER_IP, constants::WIRE_SERVER_PORT) => {
+            key_keeper_shared_state.get_wireserver_rules().await
+        }
+        (constants::GA_PLUGIN_IP, constants::GA_PLUGIN_PORT) => {
+            key_keeper_shared_state.get_hostga_rules().await
+        }
+        (constants::IMDS_IP, constants::IMDS_PORT) => {
+            key_keeper_shared_state.get_imds_rules().await
+        }
         _ => Ok(None),
     }
 }
@@ -284,7 +238,7 @@ pub fn authorize(
 ) -> AuthorizeResult {
     let auth = get_authorizer(ip, port, claims);
     logger.write(
-        LoggerLevel::Information,
+        LoggerLevel::Trace,
         format!("Got auth: {}", auth.to_string()),
     );
     auth.authorize(logger, request_uri, access_control_rules)
@@ -297,7 +251,7 @@ mod tests {
         proxy::{proxy_authorizer::AuthorizeResult, proxy_connection::ConnectionLogger},
         shared_state::key_keeper_wrapper::KeyKeeperSharedState,
     };
-    use std::str::FromStr;
+    use std::{ffi::OsString, path::PathBuf, str::FromStr};
 
     #[test]
     fn get_authenticate_test() {
@@ -306,8 +260,8 @@ mod tests {
             userName: "test".to_string(),
             userGroups: vec!["test".to_string()],
             processId: std::process::id(),
-            processName: "test".to_string(),
-            processFullPath: "test".to_string(),
+            processName: OsString::from("test"),
+            processFullPath: PathBuf::from("test"),
             processCmdLine: "test".to_string(),
             runAsElevated: true,
             clientIp: "127.0.0.1".to_string(),
@@ -341,12 +295,9 @@ mod tests {
             auth.to_string(),
             "GAPlugin { runAsElevated: true, processName: test }"
         );
-        assert!(AuthorizeResult::Ok==
-            auth.authorize(
-                test_logger.clone(),
-                test_uri.clone(),
-                None
-            ),          "GAPlugin authentication must be Ok since it has not enabled for builtin processes in the config yet"
+        assert!(
+            AuthorizeResult::Ok == auth.authorize(test_logger.clone(), test_uri.clone(), None),
+            "GAPlugin authentication must be Ok"
         );
 
         let auth = super::get_authorizer(
@@ -387,8 +338,8 @@ mod tests {
             userName: "test".to_string(),
             userGroups: vec!["test".to_string()],
             processId: std::process::id(),
-            processName: "test".to_string(),
-            processFullPath: "test".to_string(),
+            processName: OsString::from("test"),
+            processFullPath: PathBuf::from("test"),
             processCmdLine: "test".to_string(),
             runAsElevated: true,
             clientIp: "127.0.0.1".to_string(),
@@ -519,8 +470,8 @@ mod tests {
             userName: "test".to_string(),
             userGroups: vec!["test".to_string()],
             processId: std::process::id(),
-            processName: "test".to_string(),
-            processFullPath: "test".to_string(),
+            processName: OsString::from("test"),
+            processFullPath: PathBuf::from("test"),
             processCmdLine: "test".to_string(),
             runAsElevated: true,
             clientIp: "127.0.0.1".to_string(),
@@ -621,58 +572,116 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_platform_process_test() {
-        let mut claims = crate::proxy::Claims {
+    #[tokio::test]
+    async fn hostga_authenticate_test() {
+        let claims = crate::proxy::Claims {
             userId: 0,
             userName: "test".to_string(),
             userGroups: vec!["test".to_string()],
             processId: std::process::id(),
-            processName: "test".to_string(),
-            processFullPath: "test".to_string(),
+            processName: OsString::from("test"),
+            processFullPath: PathBuf::from("test"),
             processCmdLine: "test".to_string(),
             runAsElevated: true,
             clientIp: "127.0.0.1".to_string(),
             clientPort: 0, // doesn't matter for this test
         };
+        let test_logger = ConnectionLogger {
+            tcp_connection_id: 1,
+            http_connection_id: 1,
+        };
+        let auth = super::get_authorizer(
+            crate::common::constants::GA_PLUGIN_IP.to_string(),
+            crate::common::constants::GA_PLUGIN_PORT,
+            claims.clone(),
+        );
+        let url = hyper::Uri::from_str("http://localhost/test?").unwrap();
+        let key_keeper_shared_state = KeyKeeperSharedState::start_new();
 
-        #[cfg(windows)]
-        {
-            let windows_process_names = [
-                "vm-application-manager",
-                "windowsazureguestagent.exe",
-                "waappagent.exe",
-                "immediateruncommandservice.exe",
-            ];
-            for process in windows_process_names.iter() {
-                claims.processName = process.to_string();
-                assert!(
-                    super::default::is_platform_process(&claims),
-                    "{process} should be built-in process"
-                );
-            }
-        }
+        // validate disabled rules
+        let disabled_rules = AuthorizationItem {
+            defaultAccess: "deny".to_string(),
+            mode: "disabled".to_string(),
+            id: "id".to_string(),
+            rules: None,
+        };
+        key_keeper_shared_state
+            .set_hostga_rules(Some(disabled_rules))
+            .await
+            .unwrap();
+        let access_control_rules = key_keeper_shared_state.get_hostga_rules().await.unwrap();
+        assert!(
+            auth.authorize(test_logger.clone(), url.clone(), access_control_rules)
+                == AuthorizeResult::Ok,
+            "HostGA authentication must be Ok with disabled rules"
+        );
 
-        #[cfg(not(windows))]
-        {
-            let linux_process_names = ["vm-application-manager", "immediate-run-command-handler"];
-            for process in linux_process_names.iter() {
-                claims.processName = process.to_string();
-                assert!(
-                    super::default::is_platform_process(&claims),
-                    "{process} should be built-in process"
-                );
-            }
+        // validate audit rules
+        let audit_deny_rules = AuthorizationItem {
+            defaultAccess: "deny".to_string(),
+            mode: "audit".to_string(),
+            id: "id".to_string(),
+            rules: None,
+        };
+        let audit_allow_rules = AuthorizationItem {
+            defaultAccess: "allow".to_string(),
+            mode: "audit".to_string(),
+            id: "id".to_string(),
+            rules: None,
+        };
+        key_keeper_shared_state
+            .set_hostga_rules(Some(audit_allow_rules))
+            .await
+            .unwrap();
+        let access_control_rules = key_keeper_shared_state.get_hostga_rules().await.unwrap();
+        assert!(
+            auth.authorize(test_logger.clone(), url.clone(), access_control_rules)
+                == AuthorizeResult::Ok,
+            "HostGA authentication must be Ok with audit allow rules"
+        );
+        key_keeper_shared_state
+            .set_hostga_rules(Some(audit_deny_rules))
+            .await
+            .unwrap();
+        let access_control_rules = key_keeper_shared_state.get_hostga_rules().await.unwrap();
+        assert!(
+            auth.authorize(test_logger.clone(), url.clone(), access_control_rules)
+                == AuthorizeResult::OkWithAudit,
+            "HostGA authentication must be OkWithAudit with audit deny rules"
+        );
 
-            let linux_process_cmds =
-                ["python3 -u bin/WALinuxAgent-2.9.1.1-py3.8.egg -run-exthandlers"];
-            for process_cmd in linux_process_cmds.iter() {
-                claims.processCmdLine = process_cmd.to_string();
-                assert!(
-                    super::default::is_platform_process(&claims),
-                    "{process_cmd} should be built-in process"
-                );
-            }
-        }
+        // validate enforce rules
+        let enforce_allow_rules = AuthorizationItem {
+            defaultAccess: "allow".to_string(),
+            mode: "enforce".to_string(),
+            id: "id".to_string(),
+            rules: None,
+        };
+        let enforce_deny_rules = AuthorizationItem {
+            defaultAccess: "deny".to_string(),
+            mode: "enforce".to_string(),
+            id: "id".to_string(),
+            rules: None,
+        };
+        key_keeper_shared_state
+            .set_hostga_rules(Some(enforce_allow_rules))
+            .await
+            .unwrap();
+        let access_control_rules = key_keeper_shared_state.get_hostga_rules().await.unwrap();
+        assert!(
+            auth.authorize(test_logger.clone(), url.clone(), access_control_rules)
+                == AuthorizeResult::Ok,
+            "HostGA authentication must be Ok with enforce allow rules"
+        );
+        key_keeper_shared_state
+            .set_hostga_rules(Some(enforce_deny_rules))
+            .await
+            .unwrap();
+        let access_control_rules = key_keeper_shared_state.get_hostga_rules().await.unwrap();
+        assert!(
+            auth.authorize(test_logger.clone(), url.clone(), access_control_rules)
+                == AuthorizeResult::Forbidden,
+            "HostGA authentication must be Forbidden with enforce deny rules"
+        );
     }
 }

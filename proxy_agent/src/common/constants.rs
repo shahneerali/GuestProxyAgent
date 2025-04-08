@@ -28,11 +28,13 @@ pub const AUTHORIZATION_HEADER: &str = "x-ms-azure-host-authorization";
 pub const DATE_HEADER: &str = "x-ms-azure-host-date";
 pub const METADATA_HEADER: &str = "Metadata";
 pub const CONNECTION_HEADER: &str = "connection";
+pub const TIME_TICK_HEADER: &str = "x-ms-azure-time_tick";
+pub const NOTIFY_HEADER: &str = "x-ms-azure-notify";
 
 // Default Config Settings
 pub const DEFAULT_MAX_EVENT_FILE_COUNT: usize = 30;
 
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-pub const MAX_LOG_FILE_COUNT: usize = 20;
-pub const MAX_LOG_FILE_SIZE: u64 = 20 * 1024 * 1024; // 20MB
+pub const MAX_LOG_FILE_COUNT: usize = 5;
+pub const MAX_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB

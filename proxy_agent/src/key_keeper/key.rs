@@ -33,10 +33,11 @@ use crate::{
 };
 use http::{Method, StatusCode};
 use hyper::Uri;
-use proxy_agent_shared::logger_manager::LoggerLevel;
+use proxy_agent_shared::logger::LoggerLevel;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
+use std::{collections::HashMap, path::PathBuf};
 
 const AUDIT_MODE: &str = "audit";
 const ENFORCE_MODE: &str = "enforce";
@@ -79,6 +80,8 @@ pub struct AuthorizationRules {
     pub imds: Option<AuthorizationItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wireserver: Option<AuthorizationItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostga: Option<AuthorizationItem>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -211,18 +214,18 @@ impl Clone for Privilege {
 impl Privilege {
     pub fn is_match(&self, logger: &ConnectionLogger, request_url: &Uri) -> bool {
         logger.write(
-            LoggerLevel::Information,
+            LoggerLevel::Trace,
             format!("Start to match privilege '{}'", self.name),
         );
         if request_url.path().to_lowercase().starts_with(&self.path) {
             logger.write(
-                LoggerLevel::Information,
+                LoggerLevel::Trace,
                 format!("Matched privilege path '{}'", self.path),
             );
 
             if let Some(query_parameters) = &self.queryParameters {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Start to match query_parameters from privilege '{}'",
                         self.name
@@ -237,7 +240,7 @@ impl Privilege {
                         Some((_, v)) => {
                             if v.to_lowercase() == value.to_lowercase() {
                                 logger.write(
-                                    LoggerLevel::Information,
+                                    LoggerLevel::Trace,
                                     format!(
                                         "Matched query_parameters '{}:{}' from privilege '{}'",
                                         key, v, self.name
@@ -245,7 +248,7 @@ impl Privilege {
                                 );
                             } else {
                                 logger.write(
-                                    LoggerLevel::Information,
+                                    LoggerLevel::Trace,
                                         format!("Not matched query_parameters value '{}' from privilege '{}'", key, self.name),
                                     );
                                 return false;
@@ -253,7 +256,7 @@ impl Privilege {
                         }
                         None => {
                             logger.write(
-                                LoggerLevel::Information,
+                                LoggerLevel::Trace,
                                 format!(
                                     "Not matched query_parameters key '{}' from privilege '{}'",
                                     key, self.name
@@ -294,13 +297,13 @@ impl Clone for Identity {
 impl Identity {
     pub fn is_match(&self, logger: &ConnectionLogger, claims: &Claims) -> bool {
         logger.write(
-            LoggerLevel::Information,
+            LoggerLevel::Trace,
             format!("Start to match identity '{}'", self.name),
         );
         if let Some(ref user_name) = self.userName {
-            if user_name.to_lowercase() == claims.userName.to_lowercase() {
+            if *user_name == claims.userName {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Matched user name '{}' from identity '{}'",
                         user_name, self.name
@@ -308,7 +311,7 @@ impl Identity {
                 );
             } else {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Not matched user name '{}' from identity '{}'",
                         user_name, self.name
@@ -318,9 +321,10 @@ impl Identity {
             }
         }
         if let Some(ref process_name) = self.processName {
-            if process_name.to_lowercase() == claims.processName.to_lowercase() {
+            let process_name_os: OsString = process_name.into();
+            if process_name_os == claims.processName {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Matched process name '{}' from identity '{}'",
                         process_name, self.name
@@ -328,7 +332,7 @@ impl Identity {
                 );
             } else {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Not matched process name '{}' from identity '{}'",
                         process_name, self.name
@@ -338,9 +342,10 @@ impl Identity {
             }
         }
         if let Some(ref exe_path) = self.exePath {
-            if exe_path.to_lowercase() == claims.processFullPath.to_lowercase() {
+            let process_path_buf: PathBuf = exe_path.into();
+            if process_path_buf == claims.processFullPath {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Matched process full path '{}' from identity '{}'",
                         exe_path, self.name
@@ -348,7 +353,7 @@ impl Identity {
                 );
             } else {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Not matched process full path '{}' from identity '{}'",
                         exe_path, self.name
@@ -360,9 +365,9 @@ impl Identity {
         if let Some(ref group_name) = self.groupName {
             let mut matched = false;
             for claims_user_group_name in &claims.userGroups {
-                if claims_user_group_name.to_lowercase() == group_name.to_lowercase() {
+                if claims_user_group_name == group_name {
                     logger.write(
-                        LoggerLevel::Information,
+                        LoggerLevel::Trace,
                         format!(
                             "Matched user group name '{}' from identity '{}'",
                             group_name, self.name
@@ -374,7 +379,7 @@ impl Identity {
             }
             if !matched {
                 logger.write(
-                    LoggerLevel::Information,
+                    LoggerLevel::Trace,
                     format!(
                         "Not matched user group name '{}' from identity '{}'",
                         group_name, self.name
@@ -473,6 +478,7 @@ impl KeyStatus {
                         // need read details from authorizationRules
                         let wireserver;
                         let imds;
+                        let hostga;
                         match &self.authorizationRules {
                             Some(rules) => {
                                 match &rules.wireserver {
@@ -502,11 +508,25 @@ impl KeyStatus {
                                     }
                                     None => imds = " IMDS Disabled",
                                 };
+
+                                match &rules.hostga {
+                                    Some(item) => {
+                                        let mode = item.mode.to_lowercase();
+                                        if mode == ENFORCE_MODE {
+                                            hostga = "HostGA Enforce";
+                                        } else if mode == AUDIT_MODE {
+                                            hostga = "HostGA Audit";
+                                        } else {
+                                            hostga = "HostGA Disabled";
+                                        }
+                                    }
+                                    None => hostga = "HostGA Disabled",
+                                };
                             }
                             None => return super::DISABLE_STATE.to_string(),
                         }
 
-                        format!("{} - {}", wireserver, imds)
+                        format!("{} - {} - {}", wireserver, imds, hostga)
                     } else {
                         super::DISABLE_STATE.to_string()
                     }
@@ -536,6 +556,13 @@ impl KeyStatus {
         }
     }
 
+    pub fn get_hostga_rule_id(&self) -> String {
+        match self.get_hostga_rules() {
+            Some(item) => item.id.to_string(),
+            None => String::new(),
+        }
+    }
+
     pub fn get_wireserver_rules(&self) -> Option<AuthorizationItem> {
         match &self.authorizationRules {
             Some(rules) => rules.wireserver.clone(),
@@ -546,6 +573,13 @@ impl KeyStatus {
     pub fn get_imds_rules(&self) -> Option<AuthorizationItem> {
         match &self.authorizationRules {
             Some(rules) => rules.imds.clone(),
+            None => None,
+        }
+    }
+
+    pub fn get_hostga_rules(&self) -> Option<AuthorizationItem> {
+        match &self.authorizationRules {
+            Some(rules) => rules.hostga.clone(),
             None => None,
         }
     }
@@ -591,6 +625,13 @@ impl KeyStatus {
             } else {
                 AUDIT_MODE.to_string()
             }
+        }
+    }
+
+    pub fn get_hostga_mode(&self) -> String {
+        match self.get_hostga_rules() {
+            Some(item) => item.mode.to_lowercase(),
+            None => "disabled".to_string(),
         }
     }
 }
@@ -775,6 +816,13 @@ pub async fn attest_key(base_url: &Uri, key: &Key) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    #[cfg(not(windows))]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
     use super::Key;
     use super::KeyStatus;
     use crate::common::constants;
@@ -782,6 +830,7 @@ mod tests {
     use crate::key_keeper::key::Privilege;
     use crate::proxy::proxy_connection::ConnectionLogger;
     use hyper::Uri;
+    use serde_json::json;
 
     #[test]
     fn key_status_v1_test() {
@@ -971,6 +1020,79 @@ mod tests {
                             }
                         ]
                     }
+                },
+                "hostga": {
+                    "defaultAccess": "allow",
+                    "mode": "enforce",
+                    "id": "sigid",
+                    "rules": {
+                        "privileges": [
+                            {
+                                "name": "test",
+                                "path": "/test",
+                                "queryParameters": {
+                                    "key1": "value1",
+                                    "key2": "value2"
+                                }
+                            },
+                            {
+                                "name": "test2",
+                                "path": "/test2",
+                                "queryParameters": {
+                                    "key1": "value3",
+                                    "key2": "value4"
+                                }
+                            }
+                        ],
+                        "roles": [
+                            {
+                                "name": "test3",
+                                "privileges": [
+                                    "test1",
+                                    "test2"
+                                ]
+                            },
+                            {
+                                "name": "test6",
+                                "privileges": [
+                                    "test4",
+                                    "test5"
+                                ]
+                            }
+                        ],
+                        "identities": [
+                            {
+                                "name": "test",
+                                "userName": "test",
+                                "groupName": "test",
+                                "exePath": "test",
+                                "processName": "test"
+                            },
+                            {
+                                "name": "test1",
+                                "userName": "test1",
+                                "groupName": "test1",
+                                "exePath": "test1",
+                                "processName": "test1"
+                            }
+                        ],
+                        "roleAssignments": [
+                            {
+                                "role": "test4",
+                                "identities": [
+                                    "test",
+                                    "test1"
+                                ]
+                            },
+                            {
+                                "role": "test5",
+                                "identities": [
+                                    "test",
+                                    "test1"
+                                ]
+                            }
+                        ]
+                    }
                 }
             }
         }"#;
@@ -1120,6 +1242,96 @@ mod tests {
             "test", first_role_assignment.identities[0],
             "roleAssignment identities mismatch"
         );
+
+        // Validate HostGA rules
+        let hostga_rules = status.get_hostga_rules().unwrap();
+        assert_eq!(
+            "allow", hostga_rules.defaultAccess,
+            "defaultAccess mismatch"
+        );
+        assert_eq!(
+            "sigid",
+            status.get_hostga_rule_id(),
+            "HostGA rule id mismatch"
+        );
+        assert_eq!("enforce", status.get_hostga_mode(), "HostGA mode mismatch");
+
+        // Validate HostGA rule details
+        // Retrieve and validate second privilege for HostGA
+        let privilege = &hostga_rules
+            .rules
+            .as_ref()
+            .unwrap()
+            .privileges
+            .as_ref()
+            .unwrap()[1];
+
+        assert_eq!("test2", privilege.name, "privilege name mismatch");
+        assert_eq!("/test2", privilege.path, "privilege path mismatch");
+
+        assert_eq!(
+            "value3",
+            privilege.queryParameters.as_ref().unwrap()["key1"],
+            "privilege queryParameters mismatch"
+        );
+        assert_eq!(
+            "value4",
+            privilege.queryParameters.as_ref().unwrap()["key2"],
+            "privilege queryParameters mismatch"
+        );
+
+        // Retrieve and validate second role for HostGA
+        let role = &hostga_rules.rules.as_ref().unwrap().roles.as_ref().unwrap()[1];
+        assert_eq!("test6", role.name, "role name mismatch");
+        assert_eq!("test4", role.privileges[0], "role privilege mismatch");
+        assert_eq!("test5", role.privileges[1], "role privilege mismatch");
+
+        // Retrieve and validate first identity for HostGA
+        let identity = &hostga_rules
+            .rules
+            .as_ref()
+            .unwrap()
+            .identities
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!("test", identity.name, "identity name mismatch");
+        assert_eq!(
+            "test",
+            identity.userName.as_ref().unwrap(),
+            "identity userName mismatch"
+        );
+        assert_eq!(
+            "test",
+            identity.groupName.as_ref().unwrap(),
+            "identity groupName mismatch"
+        );
+        assert_eq!(
+            "test",
+            identity.exePath.as_ref().unwrap(),
+            "identity exePath mismatch"
+        );
+        assert_eq!(
+            "test",
+            identity.processName.as_ref().unwrap(),
+            "identity processName mismatch"
+        );
+
+        // Retrieve and validate first role assignment for HostGA
+        let role_assignment = &hostga_rules
+            .rules
+            .as_ref()
+            .unwrap()
+            .roleAssignments
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            "test4", role_assignment.role,
+            "roleAssignment role mismatch"
+        );
+        assert_eq!(
+            "test", role_assignment.identities[0],
+            "roleAssignment identities mismatch"
+        );
     }
 
     #[test]
@@ -1158,10 +1370,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_privilege_is_match() {
-        let logger_key = "test_privilege_is_match";
-        let mut temp_test_path = std::env::temp_dir();
-        temp_test_path.push(logger_key);
-        ConnectionLogger::init_logger(temp_test_path.to_path_buf()).await;
         let logger = ConnectionLogger {
             tcp_connection_id: 1,
             http_connection_id: 1,
@@ -1227,33 +1435,26 @@ mod tests {
             !privilege2.is_match(&logger, &url),
             "privilege should not be matched"
         );
-
-        // clean up and ignore the clean up errors
-        _ = std::fs::remove_dir_all(temp_test_path);
     }
 
     #[tokio::test]
     async fn test_identity_is_match() {
-        let logger_key = "test_identity_is_match";
-        let mut temp_test_path = std::env::temp_dir();
-        temp_test_path.push(logger_key);
-        ConnectionLogger::init_logger(temp_test_path.to_path_buf()).await;
         let logger = ConnectionLogger {
             tcp_connection_id: 1,
             http_connection_id: 1,
         };
 
-        let claims = super::Claims {
+        let mut claims = super::Claims {
             userName: "test".to_string(),
             userGroups: vec!["test".to_string()],
-            processName: "test".to_string(),
+            processName: OsString::from("test"),
             processCmdLine: "test".to_string(),
             userId: 0,
             processId: 0,
             clientIp: "00.000.000".to_string(),
             clientPort: 0, // doesn't matter for this test
             runAsElevated: true,
-            processFullPath: "test".to_string(),
+            processFullPath: PathBuf::from("test"),
         };
 
         let identity = r#"{
@@ -1315,6 +1516,15 @@ mod tests {
         );
         let identity3 = r#"{
             "name": "test",
+            "processName": "Test"
+        }"#;
+        let identity3: Identity = serde_json::from_str(identity3).unwrap();
+        assert!(
+            !identity3.is_match(&logger, &claims),
+            "identity should not be matched"
+        );
+        let identity3 = r#"{
+            "name": "test",
             "processName": "test"
         }"#;
         let identity3: Identity = serde_json::from_str(identity3).unwrap();
@@ -1327,6 +1537,15 @@ mod tests {
         let identity4 = r#"{
             "name": "test",
             "exePath": "test1"
+        }"#;
+        let identity4: Identity = serde_json::from_str(identity4).unwrap();
+        assert!(
+            !identity4.is_match(&logger, &claims),
+            "identity should not be matched"
+        );
+        let identity4 = r#"{
+            "name": "test",
+            "exePath": "TEST"
         }"#;
         let identity4: Identity = serde_json::from_str(identity4).unwrap();
         assert!(
@@ -1363,7 +1582,35 @@ mod tests {
             "identity should be matched"
         );
 
-        // clean up and ignore the clean up errors
-        _ = std::fs::remove_dir_all(temp_test_path);
+        // Test with non-UTF8 valid process name
+        #[cfg(windows)]
+        {
+            let invalid_utf16_bytes: Vec<u16> = vec![0xD800]; // Lone surrogate (0xD800)
+            claims.processName = OsString::from_wide(invalid_utf16_bytes.as_slice());
+        }
+
+        #[cfg(not(windows))]
+        {
+            let invalid_utf8_bytes: Vec<u8> = vec![0x80]; // Invalid UTF-8
+            claims.processName = OsString::from_vec(invalid_utf8_bytes);
+        }
+
+        let process_name_lossy = claims.processName.to_string_lossy().to_string();
+        let replacement_char = "�";
+
+        let identity6 = json!({
+            "name": "test",
+            "processName": replacement_char
+        });
+        let identity6: Identity = serde_json::from_value(identity6).unwrap();
+        assert!(
+            !identity6.is_match(&logger, &claims),
+            "identity should not be matched"
+        );
+
+        assert_eq!(
+            replacement_char, process_name_lossy,
+            "process name after lossy conversion should be equal to replacement char"
+        );
     }
 }

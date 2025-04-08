@@ -99,6 +99,12 @@ pub enum KeyErrorType {
 
     #[error("Failed to check local key with error: {0}")]
     CheckLocalKey(String),
+
+    #[error("Failed to get local key with error: {0}")]
+    FetchLocalKey(String),
+
+    #[error("Failed to store key locally with error: {0}")]
+    StoreLocalKey(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,7 +136,7 @@ pub enum BpfErrorType {
     #[error("Failed to get valid map '{0}' in BPF object with error: {1}")]
     GetBpfMap(String, String),
 
-    #[error("Failed to get eBPF API: API is not loaded")]
+    #[error("Failed to get eBPF API: EbpfApi.dll is not loaded")]
     GetBpfApi,
 
     #[error("Failed to get BPF object: Object is not initialized")]
@@ -193,6 +199,12 @@ pub enum WindowsApiErrorType {
 
     #[error("{0}")]
     WindowsOsError(std::io::Error),
+
+    #[error("CryptProtectData failed: {0}")]
+    CryptProtectData(std::io::Error),
+
+    #[error("CryptUnprotectData failed: {0}")]
+    CryptUnprotectData(std::io::Error),
 }
 
 #[cfg(test)]
