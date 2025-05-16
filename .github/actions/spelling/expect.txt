@@ -80,6 +80,7 @@ ebpfapi
 EBPFCORE
 egor
 ele
+ent
 entriesread
 EStorage
 etest
@@ -100,6 +101,7 @@ fffi
 ffi
 FIXEDFILEINFO
 FOF
+FSETID
 FSO
 fsprogs
 fstorage
@@ -165,6 +167,8 @@ metabuild
 MFC
 microsoftcblmariner
 microsoftlosangeles
+microsoftwindowsdesktop
+mnt
 msasn
 msp
 msrc
@@ -240,6 +244,8 @@ schtasks
 scm
 secauthz
 serice
+SETFCAP
+SETPCAP
 shd
 sids
 sigid
@@ -260,6 +266,7 @@ stdoutput
 subsecond
 substatus
 Substatuses
+SUIDSGID
 suse
 Swatinem
 SWbem
@@ -279,6 +286,7 @@ thiserror
 timedout
 timeup
 tlsv
+tmpfs
 tokio
 topdir
 totalentries
